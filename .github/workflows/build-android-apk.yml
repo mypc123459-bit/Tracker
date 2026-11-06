@@ -42,12 +42,12 @@ jobs:
         run: dart run tool/check_locales.dart
 
       - name: Build APK
-        run: flutter build apk --debug --flavor full
+        run: flutter build apk --release --flavor full
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: OpenNutriTracker-Android-debug
-          path: build/app/outputs/flutter-apk/app-full-debug.apk
+          name: OpenNutriTracker-Android-release
+          path: build/app/outputs/flutter-apk/app-full-release.apk
           if-no-files-found: error
           retention-days: 7
