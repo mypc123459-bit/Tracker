@@ -1,0 +1,276 @@
+import 'package:hive_ce_flutter/hive_flutter.dart';
+import 'package:json_annotation/json_annotation.dart';
+import 'package:opennutritracker/core/data/dbo/app_theme_dbo.dart';
+import 'package:opennutritracker/core/domain/entity/config_entity.dart';
+
+part 'config_dbo.g.dart';
+
+@HiveType(typeId: 13)
+@JsonSerializable() // Used for exporting to JSON
+class ConfigDBO extends HiveObject {
+  @HiveField(0)
+  bool hasAcceptedDisclaimer;
+  @HiveField(1)
+  bool hasAcceptedPolicy;
+  @HiveField(2)
+  bool hasAcceptedSendAnonymousData;
+  @HiveField(3)
+  AppThemeDBO selectedAppTheme;
+  @HiveField(4)
+  bool? usesImperialUnits;
+  @HiveField(5)
+  double? userKcalAdjustment;
+  @HiveField(6)
+  double? userCarbGoalPct;
+  @HiveField(7)
+  double? userProteinGoalPct;
+  @HiveField(8)
+  double? userFatGoalPct;
+  @HiveField(9)
+  bool? showActivityTracking;
+  @HiveField(10)
+  bool? notificationsEnabled;
+  @HiveField(11)
+  int? notificationHour;
+  @HiveField(12)
+  int? notificationMinute;
+  @HiveField(13)
+  String? selectedLocale;
+  @HiveField(14)
+  bool? showMealMacros;
+  @HiveField(15)
+  bool? showMicronutrients; // #237: null means default (false)
+  @HiveField(16)
+  bool? usesKilojoules; // #177: null means default (false → kcal)
+  // #150: per-meal kcal share, percent values keyed by meal type
+  // ("breakfast" / "lunch" / "dinner" / "snack"). Null means use defaults.
+  @HiveField(17)
+  Map<String, int>? mealKcalSharesPct;
+  @HiveField(18)
+  String? customMealFormMode; // #232: 'simple' or 'advanced'; null means default (simple)
+  @HiveField(19)
+  int? dayStartOffsetHours; // #139: 0-23, null means default (0 = wall-clock midnight)
+  // #160 follow-up: per-nutrient show/hide map for the daily nutrient panel.
+  // Keys are nutrient identifiers from [DailyNutrientPanel]; values are
+  // explicit user overrides. A nutrient not present in the map (or a null
+  // map altogether) means "use the default visibility", which is currently
+  // visible for every nutrient — see [ConfigEntity.isNutrientVisible].
+  @HiveField(22)
+  Map<String, bool>? nutrientPanelVisibility;
+
+  /// Per-meal sort preference for the diary day view. Keys are meal type
+  /// strings (`breakfast` / `lunch` / `dinner` / `snack`) and values are the
+  /// `DiarySortType` enum index. Nullable so existing configs without a
+  /// persisted preference keep falling back to the widget-state default
+  /// (`DiarySortType.timeAdded`) until the user picks a sort.
+  @HiveField(21)
+  Map<String, int>? diarySortPreferences;
+  // #139 follow-up: 0-59 minute companion. Composes additively with
+  // dayStartOffsetHours so existing users with hours=4 and a null minutes
+  // value see a 4:00 boundary, unchanged.
+  @HiveField(23)
+  int? dayStartOffsetMinutes;
+  // #32: configurable daily water goal in millilitres. Null means use the
+  // default (2000 ml), so existing configs without a stored value keep
+  // working without a migration.
+  @HiveField(24)
+  int? dailyWaterGoalMl;
+  // #84: persisted acknowledgement of the disordered-eating sensitivity
+  // warning shown the first time the fasting screen is opened. Once true,
+  // the warning dialog stays suppressed. Nullable so existing configs
+  // (and never-opened users) keep being treated as "not yet acknowledged".
+  @HiveField(25)
+  bool? fastingWarningAcknowledged;
+  // #415: opt-in Material You dynamic colour scheme. Null means the user
+  // has not made a deliberate choice yet, which the UI treats as "on" — the
+  // wallpaper-derived palette only actually appears on Android 12+, and on
+  // every other platform the static palette is what shows up regardless.
+  @HiveField(20)
+  bool? useMaterialYou;
+  // #415 follow-up: custom accent colour packed as a 32-bit ARGB value
+  // (e.g. 0xFFFF5733). Stores the full colour rather than just a hue so
+  // hex entry can round-trip without losing saturation or lightness.
+  // Null means "use the platform default" — Material You on Android 12+,
+  // the static palette elsewhere.
+  @HiveField(26)
+  int? accentColor;
+  // #165: whether the barcode scanner forces portrait. Null means the user
+  // has not made a deliberate choice, which the scanner treats as "follow the
+  // device" — locked on phone-sized screens (so the camera preview can't tip
+  // sideways) and free on tablets (so a landscape tablet isn't forced upright).
+  @HiveField(27)
+  bool? scannerPortraitLock;
+  // Three independent unit preferences that together replace the original
+  // single `usesImperialUnits` switch. Each is nullable so existing installs
+  // fall back to the legacy flag (see `ConfigEntity.fromConfigDBO`) and keep
+  // their current behaviour without a migration. `usesImperialUnits` is kept
+  // around as that fallback and as a coherent value for an older build.
+  @HiveField(28)
+  bool? usesImperialFoodUnits; // g/oz + ml/fl oz
+  @HiveField(29)
+  bool? usesImperialHeightUnits; // cm/ft
+  // Body weight is a three-way choice (kg / lb / st), persisted as the
+  // BodyWeightUnit enum index. Null means "derive from usesImperialUnits".
+  @HiveField(30)
+  int? bodyWeightUnitIndex;
+  // Food-source selection for the search screens. Keys are backend
+  // food_source codes (see SPConst.foodSourceDisplayNames); a source absent
+  // from the map — or a null map altogether — is enabled, so newly added
+  // sources default to on and existing installs need no migration. Open
+  // Food Facts is always enabled and deliberately has no entry here.
+  @HiveField(31)
+  Map<String, bool>? foodSourceToggles;
+  // Set true only by the demo-data seeder (see
+  // `lib/core/utils/demo/demo_seeder.dart`) when the active profile holds
+  // sample data seeded from the onboarding "try it with sample data" link,
+  // rather than a real user's own data. Null/false means real data — the
+  // Home screen's demo-mode banner only ever appears when this is true.
+  // `DeleteAllUserDataUsecase.deleteAll()` clears the whole config box, so
+  // leaving demo mode clears this for free.
+  @HiveField(32)
+  bool? isDemoData;
+  // Opt-in workout import from Health Connect (Android) / Apple Health (iOS).
+  // Null means the user has never enabled it, which reads as off — no health
+  // data is touched until they say so.
+  @HiveField(33)
+  bool? healthImportEnabled;
+  // Share of an imported workout's device-reported energy that counts toward
+  // the daily goal, stored as a fraction in 0.50–1.00. Null means "not chosen
+  // yet"; the settings flow writes a body-composition-derived suggestion the
+  // moment import is switched on (see WorkoutCompensationCalc).
+  @HiveField(34)
+  double? healthWorkoutKcalMultiplier;
+  // Watermark: the end of the window the last successful import read. Doubles
+  // as the debounce timestamp so a resume storm can't hammer the platform.
+  @HiveField(35)
+  DateTime? healthLastImportAt;
+  // External record ids of imported workouts the user has deleted. The
+  // importer's dedupe set is built from the activities actually on file, so
+  // without this the next overlapping read would file a deleted workout all
+  // over again. Kept indefinitely — it only grows by one entry per deletion,
+  // and forgetting an entry resurrects the workout it stands for. Null means
+  // nothing has been deleted.
+  // Superseded by [healthDeletedWorkouts], which carries the date each
+  // tombstone needs in order to be prunable. Read once and folded into the
+  // new field, then cleared — see `ConfigDataSource._migrateDeletedWorkouts`.
+  // Only pre-release installs can have anything here; #651 has not shipped.
+  @HiveField(36)
+  List<String>? healthDeletedExternalIds;
+  // External record ids of imported workouts the user deleted, mapped to the
+  // workout's own start time. The importer skips them, so a deletion sticks
+  // instead of being undone by the next overlapping read.
+  //
+  // The date is what makes this boundable (#768). A tombstone is only ever
+  // consulted against workouts the platform returns for the import window, so
+  // once its workout falls outside the widest window any future run could ask
+  // for, it can never match again and is dropped. Without a date the list grew
+  // with the lifetime of the install rather than with recent activity.
+  @HiveField(38)
+  Map<String, DateTime>? healthDeletedWorkouts;
+  // Which revision of the privacy policy the user has been *shown a notice
+  // about* — not which one they accepted, which `hasAcceptedPolicy` cannot
+  // answer because it is an unversioned bool (#887).
+  //
+  // Device-wide rather than per-profile: the policy describes what the app
+  // does, not what one profile does, so it is deliberately absent from the
+  // personal-field overlay in `ConfigDataSource._readMerged` and therefore
+  // read from the shared app box. A second profile does not get the notice
+  // again.
+  //
+  // Null means "no notice has ever been shown", which is every install that
+  // existed before the field did — exactly the users the notice is for.
+  @HiveField(37)
+  int? policyNoticeRevisionSeen;
+  // #1126: default the meal-detail unit dropdown to weight/volume even when
+  // the food has a scalable serving. Null means "user has never picked",
+  // which reads as false — the app keeps preferring servings until the
+  // user opts out, matching every install that predates the field.
+  @HiveField(39)
+  bool? defaultToRawFoodUnits;
+  // #1317: the day boundary, in minutes, this profile's tracked-day rows
+  // are keyed by. Per-profile: the boundary is app-wide, but only the
+  // active profile's rows move with it, so a profile that was inactive
+  // when it changed still has its rows keyed by the old one. Activation
+  // moves them from here and records the boundary they are keyed by now.
+  // Null means no build since #1317 has touched the rows, which is every
+  // profile that predates the field. Those builds keyed a row by the
+  // wall-clock date of whatever logged it, so null reads as 0 (the
+  // workout import aside; see `ensureTrackedDaysMatchEntries`).
+  @HiveField(40)
+  int? trackedDaysOffsetMinutes;
+  // Set by [reconcileAppLocale] once the OS has been *seen* holding a per-app
+  // language override — a value read from Android's picker, or the saved
+  // language read back right after the migration push. Never set by the push
+  // attempt alone: on platforms with no per-app override the push no-ops on
+  // every launch and this stays null, so null means "the OS has not been
+  // observed with an override yet", not "the push has not happened". Without
+  // it, an override the user cleared in the OS picker is indistinguishable
+  // from one that was never seeded, and gets silently pushed back on the next
+  // launch. Reset to null when that clear is acted on, so a language picked
+  // in the app afterwards whose push silently failed is retried rather than
+  // read as a second clear. Device-wide, like selectedLocale: it is a fact
+  // about the device.
+  @HiveField(41)
+  bool? localeSyncSeeded;
+
+  ConfigDBO(
+    this.hasAcceptedDisclaimer,
+    this.hasAcceptedPolicy,
+    this.hasAcceptedSendAnonymousData,
+    this.selectedAppTheme, {
+    this.usesImperialUnits = false,
+    this.userKcalAdjustment,
+    this.showActivityTracking,
+    this.showMealMacros,
+    this.notificationsEnabled,
+    this.notificationHour,
+    this.notificationMinute,
+    this.selectedLocale,
+    this.showMicronutrients,
+    this.usesKilojoules,
+    this.mealKcalSharesPct,
+    this.customMealFormMode,
+    this.dayStartOffsetHours,
+    this.diarySortPreferences,
+    this.nutrientPanelVisibility,
+    this.dayStartOffsetMinutes,
+    this.dailyWaterGoalMl,
+    this.fastingWarningAcknowledged,
+    this.useMaterialYou,
+    this.accentColor,
+    this.scannerPortraitLock,
+    this.usesImperialFoodUnits,
+    this.usesImperialHeightUnits,
+    this.bodyWeightUnitIndex,
+    this.foodSourceToggles,
+    this.isDemoData,
+    this.healthImportEnabled,
+    this.healthWorkoutKcalMultiplier,
+    this.healthLastImportAt,
+    this.healthDeletedExternalIds,
+    this.policyNoticeRevisionSeen,
+    this.healthDeletedWorkouts,
+    this.defaultToRawFoodUnits,
+    this.trackedDaysOffsetMinutes,
+    this.localeSyncSeeded,
+  });
+
+  factory ConfigDBO.empty() =>
+      ConfigDBO(false, false, false, AppThemeDBO.system);
+
+  factory ConfigDBO.fromConfigEntity(ConfigEntity entity) => ConfigDBO(
+    entity.hasAcceptedDisclaimer,
+    entity.hasAcceptedPolicy,
+    entity.hasAcceptedSendAnonymousData,
+    AppThemeDBO.fromAppThemeEntity(entity.appTheme),
+    usesImperialUnits: entity.usesImperialUnits,
+    usesImperialFoodUnits: entity.usesImperialFoodUnits,
+    usesImperialHeightUnits: entity.usesImperialHeightUnits,
+    bodyWeightUnitIndex: entity.bodyWeightUnit.index,
+  );
+
+  factory ConfigDBO.fromJson(Map<String, dynamic> json) =>
+      _$ConfigDBOFromJson(json);
+
+  Map<String, dynamic> toJson() => _$ConfigDBOToJson(this);
+}

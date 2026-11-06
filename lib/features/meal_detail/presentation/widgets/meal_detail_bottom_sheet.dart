@@ -1,0 +1,568 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:opennutritracker/core/styles/app_palette.dart';
+import 'package:opennutritracker/core/styles/dimens.dart';
+import 'package:opennutritracker/core/domain/entity/intake_entity.dart';
+import 'package:opennutritracker/core/domain/entity/intake_type_entity.dart';
+import 'package:opennutritracker/core/domain/usecase/get_intake_usecase.dart';
+import 'package:opennutritracker/core/utils/locator.dart';
+import 'package:opennutritracker/core/utils/serving_label_localizer.dart';
+import 'package:opennutritracker/core/utils/navigation_options.dart';
+import 'package:opennutritracker/core/utils/navigation_predicates.dart';
+import 'package:opennutritracker/features/add_meal/presentation/log_tray.dart';
+import 'package:opennutritracker/features/add_meal/util/portion_unit.dart';
+import 'package:opennutritracker/features/add_meal/domain/entity/meal_entity.dart';
+import 'package:opennutritracker/features/diary/presentation/bloc/calendar_day_bloc.dart';
+import 'package:opennutritracker/features/diary/presentation/bloc/diary_bloc.dart';
+import 'package:opennutritracker/features/home/presentation/bloc/home_bloc.dart';
+import 'package:opennutritracker/features/meal_detail/presentation/bloc/meal_detail_bloc.dart';
+import 'package:opennutritracker/features/meal_detail/util/quick_serving_option.dart';
+import 'package:opennutritracker/generated/l10n.dart';
+
+class MealDetailBottomSheet extends StatefulWidget {
+  final MealEntity product;
+  final DateTime day;
+  final IntakeTypeEntity intakeTypeEntity;
+  final TextEditingController quantityTextController;
+  final MealDetailBloc mealDetailBloc;
+
+  final String selectedUnit;
+
+  /// Whether the user chose imperial food units, which the serving entry's
+  /// label follows like every other amount on the screen.
+  final bool usesImperialUnits;
+
+  final Function(String?, String?) onQuantityOrUnitChanged;
+
+  /// The add-food screen's "To log" list, when the sheet was opened from it.
+  /// The button then adds to the list instead of logging.
+  final LogTray? logTray;
+
+  const MealDetailBottomSheet({
+    super.key,
+    required this.product,
+    required this.day,
+    required this.intakeTypeEntity,
+    required this.quantityTextController,
+    required this.onQuantityOrUnitChanged,
+    required this.mealDetailBloc,
+    required this.selectedUnit,
+    this.usesImperialUnits = false,
+    this.logTray,
+  });
+
+  @override
+  State<MealDetailBottomSheet> createState() => _MealDetailBottomSheetState();
+}
+
+class _MealDetailBottomSheetState extends State<MealDetailBottomSheet> {
+  final _quantityFocusNode = FocusNode();
+
+  /// Set from the first tap on Add until its submission ends. The save can
+  /// wait for the tracked-day lock (#1317) with the sheet still open, and
+  /// a second tap would pass the duplicate check again and log the meal
+  /// twice.
+  bool _submitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.quantityTextController.addListener(_onQuantityChanged);
+    _quantityFocusNode.addListener(_onQuantityFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _quantityFocusNode.removeListener(_onQuantityFocusChanged);
+    _quantityFocusNode.dispose();
+    widget.quantityTextController.removeListener(_onQuantityChanged);
+    super.dispose();
+  }
+
+  void _onQuantityFocusChanged() {
+    if (_quantityFocusNode.hasFocus) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_quantityFocusNode.hasFocus) return;
+        _selectAllQuantityText();
+      });
+    }
+  }
+
+  void _selectAllQuantityText() {
+    final text = widget.quantityTextController.text;
+    widget.quantityTextController.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: text.length,
+    );
+  }
+
+  void _onQuantityChanged() {
+    widget.onQuantityOrUnitChanged(
+      widget.quantityTextController.text,
+      widget.selectedUnit,
+    );
+  }
+
+  void _onQuickServingSelected(QuickServingOption option) {
+    final quantityText = _formatQuantity(option.quantity);
+    // Detach the change listener before the programmatic write, otherwise
+    // setting the controller's text fires _onQuantityChanged with the OLD
+    // unit before the callback below applies option.unit — so every chip
+    // tap emitted a stale-unit UpdateKcalEvent (100 g briefly computed as
+    // 100 servings) before landing on the right one.
+    widget.quantityTextController.removeListener(_onQuantityChanged);
+    widget.quantityTextController.text = quantityText;
+    widget.quantityTextController.addListener(_onQuantityChanged);
+    widget.onQuantityOrUnitChanged(quantityText, option.unit);
+  }
+
+  String _formatQuantity(double value) {
+    if (value == value.roundToDouble()) {
+      return value.toInt().toString();
+    }
+    return value.toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final productMissingRequiredInfo = _hasRequiredProductInfoMissing();
+    final missingFieldsText = S.of(
+      context,
+    ).missingProductInfoFields(_missingRequiredProductInfo().join(', '));
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final palette = isDark ? AppPalette.dark : AppPalette.light;
+    return BottomSheet(
+      elevation: 0,
+      onClosing: () {},
+      enableDrag: false,
+      builder: (context) {
+        // Quick-quantity presets — one tap to a common portion instead of
+        // typing. Uses the food's own serving when it has one and 100 g
+        // for solids. Computed once so the collection-if below can drop
+        // the row entirely when nothing applies (no orphan SizedBox).
+        final quickOptions = productMissingRequiredInfo
+            ? const <QuickServingOption>[]
+            : quickServingOptionsFor(
+                widget.product,
+                S.of(context).gramUnit,
+              );
+        return Container(
+          decoration: BoxDecoration(
+            border: Border(
+              top: BorderSide(color: palette.border, width: Dimens.hairline),
+            ),
+            color: palette.surface,
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(Dimens.radiusL),
+              topRight: Radius.circular(Dimens.radiusL),
+            ),
+          ),
+          child: SafeArea(
+            top: false,
+            child: Wrap(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16.0, 32.0, 16.0, 8.0),
+                  child: Column(
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextFormField(
+                              enabled: !productMissingRequiredInfo,
+                              controller: widget.quantityTextController,
+                              focusNode: _quantityFocusNode,
+                              onTap: _selectAllQuantityText,
+                              keyboardType: TextInputType.numberWithOptions(
+                                decimal: true,
+                              ),
+                              inputFormatters: [
+                                FilteringTextInputFormatter.allow(
+                                  RegExp(r'^\d+([.,]\d{0,2})?$'),
+                                ),
+                              ],
+                              decoration: InputDecoration(
+                                border: const OutlineInputBorder(
+                                  borderRadius: Dimens.borderRadiusM,
+                                ),
+                                labelText: S.of(context).quantityLabel,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 16.0),
+                          Expanded(
+                            child: DropdownButtonFormField(
+                              isExpanded: true,
+                              itemHeight: null,
+                              initialValue: widget.selectedUnit,
+                              key: ValueKey(widget.selectedUnit),
+                              decoration: InputDecoration(
+                                border: const OutlineInputBorder(
+                                  borderRadius: Dimens.borderRadiusM,
+                                ),
+                                labelText: S.of(context).unitLabel,
+                              ),
+                              items: <DropdownMenuItem<String>>[
+                                // #629: a serving the app cannot scale
+                                // is a no-op dressed as a unit.
+                                if (widget.product.scalableServingQuantity !=
+                                    null)
+                                  _getServingDropdownItem(context),
+                                if (widget.product.isSolid ||
+                                    !widget.product.isLiquid &&
+                                        !widget.product.isSolid)
+                                  ..._getSolidUnitDropdownItems(context),
+                                if (widget.product.isLiquid ||
+                                    !widget.product.isLiquid &&
+                                        !widget.product.isSolid)
+                                  ..._getLiquidUnitDropdownItems(context),
+                                ..._getOtherDropdownItems(context),
+                              ],
+                              onChanged: (value) {
+                                widget.onQuantityOrUnitChanged(
+                                  widget.quantityTextController.text,
+                                  value,
+                                );
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (quickOptions.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(
+                            top: Dimens.spacing12,
+                          ),
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: Wrap(
+                              spacing: Dimens.spacing8,
+                              children: [
+                                for (final option in quickOptions)
+                                  Semantics(
+                                    identifier:
+                                        'meal-detail-chip-${option.id}',
+                                    child: ActionChip(
+                                      label: Text(option.label),
+                                      onPressed: () =>
+                                          _onQuickServingSelected(option),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      const SizedBox(height: Dimens.spacing16),
+                      Semantics(
+                        identifier: 'meal-detail-add',
+                        child: SizedBox(
+                          width: double.infinity, // Make button full width
+                          child: FilledButton.icon(
+                            onPressed:
+                                !productMissingRequiredInfo && !_submitting
+                                ? () {
+                                    onAddButtonPressed(context);
+                                  }
+                                : null,
+                            style: FilledButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(
+                                vertical: Dimens.spacing16,
+                              ),
+                              shape: const RoundedRectangleBorder(
+                                borderRadius: Dimens.borderRadiusM,
+                              ),
+                            ),
+                            icon: const Icon(Icons.add_rounded),
+                            label: Text(
+                              widget.logTray == null
+                                  ? S.of(context).addLabel
+                                  : S.of(context).addToListLabel,
+                            ),
+                          ),
+                        ),
+                      ),
+                      productMissingRequiredInfo
+                          ? Text(
+                              '${S.of(context).missingProductInfo}\n'
+                              '$missingFieldsText',
+                              style: Theme.of(context).textTheme.bodyMedium
+                                  ?.copyWith(
+                                    color: Theme.of(context).colorScheme.error,
+                                  ),
+                            )
+                          : const SizedBox(),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  bool _hasRequiredProductInfoMissing() =>
+      _missingRequiredProductInfo().isNotEmpty;
+
+  /// The labels of the required values the product lacks, so the warning
+  /// can say which one is missing (#1474).
+  List<String> _missingRequiredProductInfo() {
+    final productNutriments = widget.product.nutriments;
+    final s = S.of(context);
+    return [
+      if (productNutriments.energyKcal100 == null) s.energyLabel,
+      if (productNutriments.carbohydrates100 == null) s.carbohydrateLabel,
+      if (productNutriments.fat100 == null) s.fatLabel,
+      if (productNutriments.proteins100 == null) s.proteinLabel,
+    ];
+  }
+
+  Future<void> onAddButtonPressed(BuildContext context) async {
+    // Checked here, not only through the disabled button: a second tap
+    // can land before the rebuild that disables it.
+    if (_submitting) return;
+    setState(() => _submitting = true);
+    try {
+      await _submit(context);
+    } finally {
+      // A save that succeeds leaves the sheet; a rejected quantity, a
+      // cancelled duplicate or a failed save lets the user try again.
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  Future<void> _submit(BuildContext context) async {
+    // Validate quantity (#209, #210)
+    final quantityText = widget.quantityTextController.text.replaceAll(
+      ',',
+      '.',
+    );
+    final quantity = double.tryParse(quantityText);
+
+    if (quantity == null || quantity <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${S.of(context).quantityLabel} must be greater than 0',
+          ),
+        ),
+      );
+      return;
+    }
+
+    // Reasonable maximum limit per meal (#210)
+    if (quantity > 10000) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${S.of(context).quantityLabel} seems unrealistically high',
+          ),
+        ),
+      );
+      return;
+    }
+
+    // Check for duplicate additions (#212)
+    final isDuplicate = await _checkForDuplicate(context);
+    if (!context.mounted) return;
+    if (isDuplicate) {
+      final shouldAdd = await _showDuplicateDialog(context);
+      if (!context.mounted) return;
+      if (shouldAdd != true) return;
+    }
+
+    final logTray = widget.logTray;
+    if (logTray != null) {
+      // Onto the list, with exactly what `addIntake` below would have been
+      // given; the add-food screen writes it when the list is logged.
+      final state = widget.mealDetailBloc.state;
+      logTray.add(
+        LogTrayItem(
+          meal: widget.product,
+          unit: storedUnit(state.selectedUnit),
+          amount: double.parse(
+            state.totalQuantityConverted.replaceAll(',', '.'),
+          ),
+          amountLabel: logTrayAmountLabel(
+            context,
+            quantity,
+            state.selectedUnit,
+            widget.product,
+          ),
+        ),
+      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(S.of(context).logTrayAddedLabel)));
+      // Back to the list, past the scanner too when that is how the user
+      // came: it replaced itself with this screen.
+      Navigator.of(
+        context,
+      ).popUntil(namedRouteOrFirst(NavigationOptions.addMealRoute));
+      return;
+    }
+
+    // The refreshes below only see the intake once it is stored, which
+    // can wait for the tracked-day lock (#1317).
+    await widget.mealDetailBloc.addIntake(
+      context,
+      widget.mealDetailBloc.state.selectedUnit,
+      widget.mealDetailBloc.state.totalQuantityConverted,
+      widget.intakeTypeEntity,
+      widget.product,
+      widget.day,
+    );
+
+    // Refresh Home Page
+    locator<HomeBloc>().add(const LoadItemsEvent());
+
+    // Refresh Diary Page - Pass the day to preserve selection (#154)
+    locator<DiaryBloc>().add(const LoadDiaryYearEvent());
+    locator<CalendarDayBloc>().add(const RefreshCalendarDayEvent());
+
+    if (!context.mounted) return;
+    // Show snackbar and return to dashboard
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(S.of(context).infoAddedIntakeLabel)));
+    Navigator.of(
+      context,
+    ).popUntil(namedRouteOrFirst(NavigationOptions.mainRoute));
+  }
+
+  // #212: Check if this meal was already added today for the same meal type
+  Future<bool> _checkForDuplicate(BuildContext context) async {
+    final getIntakeUsecase = locator<GetIntakeUsecase>();
+    final List<IntakeEntity> todayIntakes;
+
+    switch (widget.intakeTypeEntity) {
+      case IntakeTypeEntity.breakfast:
+        todayIntakes = await getIntakeUsecase.getBreakfastIntakeByDay(
+          widget.day,
+        );
+        break;
+      case IntakeTypeEntity.lunch:
+        todayIntakes = await getIntakeUsecase.getLunchIntakeByDay(widget.day);
+        break;
+      case IntakeTypeEntity.dinner:
+        todayIntakes = await getIntakeUsecase.getDinnerIntakeByDay(widget.day);
+        break;
+      case IntakeTypeEntity.snack:
+        todayIntakes = await getIntakeUsecase.getSnackIntakeByDay(widget.day);
+        break;
+    }
+
+    // Check if meal with same code or name already exists
+    return todayIntakes.any(
+      (intake) =>
+          (widget.product.code != null &&
+              intake.meal.code == widget.product.code) ||
+          (widget.product.name != null &&
+              intake.meal.name == widget.product.name),
+    );
+  }
+
+  // #212: Show confirmation dialog for duplicate meals
+  Future<bool?> _showDuplicateDialog(BuildContext context) {
+    return showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text(S.of(context).warningLabel),
+          content: Text(S.of(context).duplicateMealDialogContent),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: Text(S.of(context).dialogCancelLabel),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: Text(S.of(context).addLabel),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  DropdownMenuItem<String> _getServingDropdownItem(BuildContext context) {
+    // Custom meals are seeded from MealEntity.empty(), which carries an empty
+    // servingSize string rather than null. An empty (or whitespace-only)
+    // description should fall through to the constructed label so the option
+    // doesn't render blank — otherwise '' wins over the ?? fallback (#495).
+    final servingSize = widget.product.servingSize;
+    // Serving labels are stored in English (see MealEntity._spServingLabel);
+    // translate the common household units at display time.
+    final servingLabel = (servingSize != null && servingSize.trim().isNotEmpty)
+        ? localizeServingLabel(S.of(context), servingSize)
+        : '${S.of(context).servingLabel} (${widget.product.servingQuantity} ${widget.product.servingUnit})';
+    // The label is the food's own text, in grams or millilitres (#1368).
+    final servingText = widget.usesImperialUnits
+        ? imperialServingLabel(S.of(context), servingLabel)
+        : servingLabel;
+    return DropdownMenuItem(
+      value: UnitDropdownItem.serving.toString(),
+      child: Text(servingText, overflow: TextOverflow.ellipsis, maxLines: 1),
+    );
+  }
+
+  List<DropdownMenuItem<String>> _getSolidUnitDropdownItems(
+    BuildContext context,
+  ) {
+    return [
+      DropdownMenuItem(
+        value: UnitDropdownItem.g.toString(),
+        child: Text(
+          S.of(context).gramUnit,
+          overflow: TextOverflow.ellipsis,
+          maxLines: 1,
+        ),
+      ),
+      DropdownMenuItem(
+        value: UnitDropdownItem.oz.toString(),
+        child: Text(
+          S.of(context).ozUnit,
+          overflow: TextOverflow.ellipsis,
+          maxLines: 1,
+        ),
+      ),
+    ];
+  }
+
+  List<DropdownMenuItem<String>> _getLiquidUnitDropdownItems(
+    BuildContext context,
+  ) {
+    return [
+      DropdownMenuItem(
+        value: UnitDropdownItem.ml.toString(),
+        child: Text(
+          S.of(context).milliliterUnit,
+          overflow: TextOverflow.ellipsis,
+          maxLines: 1,
+        ),
+      ),
+      DropdownMenuItem(
+        value: UnitDropdownItem.flOz.toString(),
+        child: Text(
+          S.of(context).flOzUnit,
+          overflow: TextOverflow.ellipsis,
+          maxLines: 1,
+        ),
+      ),
+    ];
+  }
+
+  List<DropdownMenuItem<String>> _getOtherDropdownItems(BuildContext context) {
+    return [
+      DropdownMenuItem(
+        value: UnitDropdownItem.gml.toString(),
+        child: Text(
+          "${S.of(context).notAvailableLabel} (${S.of(context).gramMilliliterUnit})",
+          overflow: TextOverflow.ellipsis,
+          maxLines: 1,
+        ),
+      ),
+    ];
+  }
+}

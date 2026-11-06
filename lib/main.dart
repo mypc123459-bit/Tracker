@@ -1,0 +1,413 @@
+import 'dart:async';
+
+import 'package:dynamic_color/dynamic_color.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:logging/logging.dart';
+import 'package:opennutritracker/core/data/data_source/remote_search_cache_data_source.dart';
+import 'package:opennutritracker/core/data/data_source/user_data_source.dart';
+import 'package:opennutritracker/core/data/repository/config_repository.dart';
+import 'package:opennutritracker/core/domain/entity/app_theme_entity.dart';
+import 'package:opennutritracker/core/l10n/app_locales.dart';
+import 'package:opennutritracker/core/presentation/main_screen.dart';
+import 'package:opennutritracker/core/presentation/splash_screen.dart';
+import 'package:opennutritracker/core/presentation/storage_recovery_app.dart';
+import 'package:opennutritracker/core/presentation/widgets/image_full_screen.dart';
+import 'package:opennutritracker/core/presentation/widgets/keyboard_dismisser.dart';
+import 'package:opennutritracker/core/styles/app_palette.dart';
+import 'package:opennutritracker/core/styles/app_theme.dart';
+import 'package:opennutritracker/core/utils/app_locale_service.dart';
+import 'package:opennutritracker/core/utils/app_locale_sync.dart';
+import 'package:opennutritracker/core/utils/daily_reminder_scheduler.dart';
+import 'package:opennutritracker/core/utils/widget/calorie_widget_writer.dart';
+import 'package:opennutritracker/core/utils/env.dart';
+import 'package:opennutritracker/core/utils/hive_storage_integrity_exception.dart';
+import 'package:opennutritracker/core/utils/locator.dart';
+import 'package:opennutritracker/core/utils/logger_config.dart';
+import 'package:opennutritracker/core/utils/sentry_config.dart';
+import 'package:opennutritracker/core/utils/navigation_options.dart';
+import 'package:opennutritracker/core/utils/energy_unit_provider.dart';
+import 'package:opennutritracker/core/utils/locale_provider.dart';
+import 'package:opennutritracker/core/utils/theme_mode_provider.dart';
+import 'package:opennutritracker/features/activity_detail/activity_detail_screen.dart';
+import 'package:opennutritracker/features/add_meal/presentation/add_meal_screen.dart';
+import 'package:opennutritracker/features/add_meal/presentation/screens/bulk_add_screen.dart';
+import 'package:opennutritracker/features/add_activity/presentation/add_activity_screen.dart';
+import 'package:opennutritracker/features/edit_meal/presentation/edit_meal_screen.dart';
+import 'package:opennutritracker/features/onboarding/onboarding_screen.dart';
+import 'package:opennutritracker/features/fasting/presentation/fasting_screen.dart';
+import 'package:opennutritracker/features/profile/presentation/screens/manage_profiles_screen.dart';
+import 'package:opennutritracker/features/profile/presentation/weight_history_screen.dart';
+import 'package:opennutritracker/features/recipes/presentation/screens/import_recipe_scanner_screen.dart';
+import 'package:opennutritracker/features/recipes/presentation/screens/recipe_builder_screen.dart';
+import 'package:opennutritracker/features/recipes/presentation/screens/recipe_detail_screen.dart';
+import 'package:opennutritracker/features/recipes/presentation/screens/recipes_page.dart';
+import 'package:opennutritracker/features/home/presentation/screens/import_activity_scanner_screen.dart';
+import 'package:opennutritracker/features/home/presentation/screens/import_meal_scanner_screen.dart';
+import 'package:opennutritracker/features/scanner/scanner_screen.dart';
+import 'package:opennutritracker/features/meal_detail/meal_detail_screen.dart';
+import 'package:opennutritracker/features/settings/presentation/bloc/settings_bloc.dart';
+import 'package:opennutritracker/features/settings/presentation/widgets/accent_colour_screen.dart';
+import 'package:opennutritracker/features/settings/presentation/widgets/health_sync_screen.dart';
+import 'package:opennutritracker/features/settings/settings_screen.dart';
+import 'package:opennutritracker/generated/l10n.dart';
+import 'package:provider/provider.dart';
+import 'package:sentry_flutter/sentry_flutter.dart';
+
+/// The locales the app resolves against: gen-l10n's list narrowed to the
+/// shipped languages, computed once (WidgetsApp compares the list by
+/// identity, so a fresh list per build would re-resolve on every rebuild).
+final _appLocales = appLocales(S.supportedLocales);
+
+/// Best-effort: a notification plugin that fails is logged, never allowed to
+/// keep the app from opening or to escape a language change.
+Future<void> _refreshDailyReminder(Locale? locale) =>
+    locator<DailyReminderScheduler>().refresh(locale: locale);
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  LoggerConfig.intiLogger();
+  await _bootstrapApp();
+}
+
+Future<void> _bootstrapApp() async {
+  final log = Logger('main');
+  try {
+    await initLocator();
+  } on HiveStorageIntegrityException catch (error, stackTrace) {
+    // Consent (and thus Sentry) lives in the encrypted Config Hive box, so it
+    // cannot be read on this path. Keep diagnostics local and preserve the
+    // database files while giving the user a safe, retryable recovery screen.
+    log.severe(
+      'Local database integrity failure during bootstrap '
+      '(code=${error.code}). Not reporting to Sentry before consent.',
+      error,
+      stackTrace,
+    );
+    runApp(StorageRecoveryApp(errorCode: error.code, onRetry: _bootstrapApp));
+    return;
+  }
+
+  // Drop cached remote-search results that haven't been touched in 90
+  // days. Done once per app start; no need to schedule a recurring task.
+  unawaited(
+    locator<RemoteSearchCacheDataSource>().pruneStale(const Duration(days: 90)),
+  );
+
+  final isUserInitialized = await locator<UserDataSource>().hasUserData();
+  final configRepo = locator<ConfigRepository>();
+
+  final config = await configRepo.getConfig();
+  // Android's own per-app language picker and ours are two doors into the
+  // same setting, so ask the system what it holds before trusting what we
+  // saved. See [reconcileAppLocale] for which side wins and why.
+  final systemLocale = await AppLocaleService.getApplicationLocale();
+  final localeCode = await reconcileAppLocale(
+    savedLocaleCode: await configRepo.getSelectedLocale(),
+    systemLocaleTag: systemLocale.tag,
+    systemTagReadFailed: systemLocale.readFailed,
+    localeSyncSeeded: await configRepo.getLocaleSyncSeeded(),
+    supportedLocales: _appLocales,
+    persistSelectedLocale: configRepo.setSelectedLocale,
+    pushToSystem: AppLocaleService.setApplicationLocale,
+    readSystemTag: AppLocaleService.getApplicationLocale,
+    markLocaleSyncSeeded: configRepo.setLocaleSyncSeeded,
+    clearLocaleSyncSeeded: configRepo.clearLocaleSyncSeeded,
+  );
+  final savedLocale = localeCode != null ? Locale(localeCode) : null;
+
+  // #312: Restore scheduled notifications after app start / device reboot,
+  // in the user's language. Android re-applies the channel name/description
+  // on every (re)registration, and they surface in the OS settings, so this
+  // keeps them from reverting to English on each launch. Runs after
+  // [reconcileAppLocale] so it uses the language the app ends up in, not the
+  // one saved before the OS was consulted. A language change while the app
+  // runs reschedules through [LocaleProvider] (#1366).
+  // Not awaited: it queues on the scheduler at once, so Settings still runs
+  // after it, but start-up never waits on (or fails with) the plugin.
+  unawaited(_refreshDailyReminder(savedLocale));
+  final hasAcceptedAnonymousData = await configRepo
+      .getConfigHasAcceptedAnonymousData();
+  final savedAppTheme = await configRepo.getConfigAppTheme();
+  final savedUsesKilojoules = config.usesKilojoules;
+  final savedUseMaterialYou = config.useMaterialYou;
+  final savedAccentColor = config.accentColor;
+
+  // If the user has accepted anonymous data collection, run the app with
+  // sentry enabled, else run without it
+  if (kReleaseMode && hasAcceptedAnonymousData) {
+    log.info('Starting App with Sentry enabled ...');
+    _runAppWithSentryReporting(
+      isUserInitialized,
+      savedAppTheme,
+      savedLocale,
+      savedUsesKilojoules,
+      savedUseMaterialYou,
+      savedAccentColor,
+    );
+  } else {
+    log.info('Starting App ...');
+    runAppWithChangeNotifiers(
+      isUserInitialized,
+      savedAppTheme,
+      savedLocale,
+      savedUsesKilojoules,
+      savedUseMaterialYou,
+      savedAccentColor,
+    );
+  }
+}
+
+void _runAppWithSentryReporting(
+  bool isUserInitialized,
+  AppThemeEntity savedAppTheme,
+  Locale? savedLocale,
+  bool savedUsesKilojoules,
+  bool savedUseMaterialYou,
+  int? savedAccentColor,
+) async {
+  await SentryFlutter.init(
+    (options) => configureSentryOptions(options, dsn: Env.sentryDns),
+    appRunner: () => runAppWithChangeNotifiers(
+      isUserInitialized,
+      savedAppTheme,
+      savedLocale,
+      savedUsesKilojoules,
+      savedUseMaterialYou,
+      savedAccentColor,
+    ),
+  );
+}
+
+void runAppWithChangeNotifiers(
+  bool userInitialized,
+  AppThemeEntity savedAppTheme,
+  Locale? savedLocale,
+  bool savedUsesKilojoules,
+  bool savedUseMaterialYou,
+  int? savedAccentColor,
+) => runApp(
+  MultiProvider(
+    providers: [
+      ChangeNotifierProvider(
+        create: (_) => ThemeModeProvider(
+          appTheme: savedAppTheme,
+          useMaterialYou: savedUseMaterialYou,
+          accentColor: savedAccentColor,
+        ),
+      ),
+      ChangeNotifierProvider(
+        create: (_) => LocaleProvider(
+          locale: savedLocale,
+          onChanged: (locale) => unawaited(_refreshDailyReminder(locale)),
+          calorieWidgetStore: locator<CalorieWidgetStore>(),
+          relabelCalorieWidget: !userInitialized,
+        ),
+      ),
+      ChangeNotifierProvider(
+        create: (_) => EnergyUnitProvider(usesKilojoules: savedUsesKilojoules),
+      ),
+    ],
+    child: OpenNutriTrackerApp(userInitialized: userInitialized),
+  ),
+);
+
+class OpenNutriTrackerApp extends StatefulWidget {
+  final bool userInitialized;
+
+  const OpenNutriTrackerApp({super.key, required this.userInitialized});
+
+  @override
+  State<OpenNutriTrackerApp> createState() => _OpenNutriTrackerAppState();
+}
+
+class _OpenNutriTrackerAppState extends State<OpenNutriTrackerApp>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// Android delivers this when someone changes the app's language from
+  /// Settings -> Apps -> OpenNutriTracker -> Language while the app is alive.
+  /// `MaterialApp.locale` is pinned to our own saved choice, so without
+  /// adopting the new value here that picker would appear to do nothing.
+  @override
+  void didChangeLocales(List<Locale>? locales) {
+    super.didChangeLocales(locales);
+    unawaited(_adoptSystemLocale());
+  }
+
+  /// True while [_adoptSystemLocale] is between its awaits; a second entry
+  /// then only queues a re-run instead of racing the first.
+  bool _adoptingSystemLocale = false;
+  bool _adoptSystemLocaleQueued = false;
+
+  /// The same [reconcileAppLocale] the launch path runs, deliberately: this
+  /// fires for any locale change — the per-app picker, but also a plain
+  /// system-language change on platforms with no per-app override — and a
+  /// second hand-rolled copy of the decision table here could disagree with
+  /// the launch one about the same OS state within one session. Only the
+  /// screen update is local; every persistence decision stays in one place.
+  ///
+  /// Serialized against itself: reconciling can change the locale (the
+  /// migration push), which re-fires [didChangeLocales] while the first run
+  /// is still mid-flight. Overlapping runs would read the same pre-write
+  /// config snapshot and double-apply it, so a run arriving early is queued
+  /// and replayed once the current one finishes — dropped instead of
+  /// queued, it could miss a clear that arrived mid-run.
+  Future<void> _adoptSystemLocale() async {
+    if (_adoptingSystemLocale) {
+      _adoptSystemLocaleQueued = true;
+      return;
+    }
+    _adoptingSystemLocale = true;
+    try {
+      do {
+        _adoptSystemLocaleQueued = false;
+        // Shared with the in-app picker: see [LocaleSyncLock].
+        await localeSyncLock.run(_reconcileAndAdoptLocale);
+      } while (_adoptSystemLocaleQueued);
+    } finally {
+      _adoptingSystemLocale = false;
+    }
+  }
+
+  Future<void> _reconcileAndAdoptLocale() async {
+    final configRepo = locator<ConfigRepository>();
+    final systemLocale = await AppLocaleService.getApplicationLocale();
+    final localeCode = await reconcileAppLocale(
+      savedLocaleCode: await configRepo.getSelectedLocale(),
+      systemLocaleTag: systemLocale.tag,
+      systemTagReadFailed: systemLocale.readFailed,
+      localeSyncSeeded: await configRepo.getLocaleSyncSeeded(),
+      supportedLocales: _appLocales,
+      persistSelectedLocale: configRepo.setSelectedLocale,
+      pushToSystem: AppLocaleService.setApplicationLocale,
+      readSystemTag: AppLocaleService.getApplicationLocale,
+      markLocaleSyncSeeded: configRepo.setLocaleSyncSeeded,
+      clearLocaleSyncSeeded: configRepo.clearLocaleSyncSeeded,
+    );
+    // Persistence above deliberately ran to completion regardless of widget
+    // lifetime — what is saved must not depend on whether this State is
+    // still mounted. Only the on-screen update needs the live context.
+    if (!mounted) return;
+
+    final localeProvider = Provider.of<LocaleProvider>(context, listen: false);
+    if (localeProvider.locale?.languageCode == localeCode) {
+      // Reconciliation kept the in-app language. While that is "System
+      // default", this event may be a device language change: MaterialApp
+      // follows it by itself; the reminder the OS holds does not (#1366).
+      localeProvider.systemLocalesChanged();
+      return;
+    }
+
+    localeProvider.updateLocale(localeCode != null ? Locale(localeCode) : null);
+    // The config was rewritten above, and the singleton SettingsBloc only
+    // reloads on LoadSettingsEvent: without this the Language tile and the
+    // picker's preselection keep the pre-reconcile value, and confirming the
+    // picker would push back the override the user just cleared in the OS.
+    locator<SettingsBloc>().add(LoadSettingsEvent());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // #415: DynamicColorBuilder hands back null on platforms that don't
+    // support wallpaper-derived colours (iOS, older Android, desktop test
+    // builds), so the static palette always remains as a graceful fallback.
+    final themeProvider = Provider.of<ThemeModeProvider>(context);
+    final useMaterialYou = themeProvider.useMaterialYou;
+    final accentColor = themeProvider.accentColor;
+    return DynamicColorBuilder(
+      builder: (lightDynamic, darkDynamic) {
+        // The friendly-flat canvas, surfaces and macro colours are fixed; only
+        // the single vivid accent follows the user. Material You (when enabled)
+        // or a picked accent drives that one role, otherwise the brand green.
+        AppPalette light = AppPalette.light;
+        AppPalette dark = AppPalette.dark;
+        if (useMaterialYou && lightDynamic != null && darkDynamic != null) {
+          light = light.withAccent(lightDynamic.harmonized().primary);
+          dark = dark.withAccent(darkDynamic.harmonized().primary);
+        } else if (accentColor != null) {
+          final seed = Color(accentColor);
+          light = light.withAccent(seed);
+          dark = dark.withAccent(seed);
+        }
+        return _buildMaterialApp(context, light, dark);
+      },
+    );
+  }
+
+  Widget _buildMaterialApp(
+    BuildContext context,
+    AppPalette lightPalette,
+    AppPalette darkPalette,
+  ) {
+    return MaterialApp(
+      onGenerateTitle: (context) => S.of(context).appTitle,
+      debugShowCheckedModeBanner: false,
+      theme: buildAppTheme(lightPalette),
+      darkTheme: buildAppTheme(darkPalette),
+      themeMode: Provider.of<ThemeModeProvider>(context).themeMode,
+      locale: Provider.of<LocaleProvider>(context).locale,
+      localizationsDelegates: const [
+        S.delegate,
+        GlobalMaterialLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+      ],
+      supportedLocales: _appLocales,
+      // Above the Navigator, so dialogs and sheets are covered too.
+      builder: (context, child) =>
+          KeyboardDismisser(child: child ?? const SizedBox.shrink()),
+      initialRoute: NavigationOptions.splashRoute,
+      routes: {
+        NavigationOptions.splashRoute: (context) =>
+            SplashScreen(userInitialized: widget.userInitialized),
+        NavigationOptions.mainRoute: (context) => const MainScreen(),
+        NavigationOptions.onboardingRoute: (context) =>
+            const OnboardingScreen(),
+        NavigationOptions.settingsRoute: (context) => const SettingsScreen(),
+        NavigationOptions.accentColourRoute: (context) =>
+            const AccentColourScreen(),
+        NavigationOptions.healthSyncRoute: (context) => const HealthSyncScreen(),
+        NavigationOptions.addMealRoute: (context) => const AddMealScreen(),
+        NavigationOptions.bulkAddRoute: (context) => const BulkAddScreen(),
+        NavigationOptions.scannerRoute: (context) => const ScannerScreen(),
+        NavigationOptions.mealDetailRoute: (context) =>
+            const MealDetailScreen(),
+        NavigationOptions.editMealRoute: (context) => const EditMealScreen(),
+        NavigationOptions.addActivityRoute: (context) =>
+            const AddActivityScreen(),
+        NavigationOptions.activityDetailRoute: (context) =>
+            const ActivityDetailScreen(),
+        NavigationOptions.imageFullScreenRoute: (context) =>
+            const ImageFullScreen(),
+        NavigationOptions.importMealScannerRoute: (context) =>
+            const ImportMealScannerScreen(),
+        NavigationOptions.importActivityScannerRoute: (context) =>
+            const ImportActivityScannerScreen(),
+        NavigationOptions.recipesRoute: (context) => const RecipesPage(),
+        NavigationOptions.recipeBuilderRoute: (context) =>
+            const RecipeBuilderScreen(),
+        NavigationOptions.recipeDetailRoute: (context) =>
+            const RecipeDetailScreen(),
+        NavigationOptions.importRecipeScannerRoute: (context) =>
+            const ImportRecipeScannerScreen(),
+        NavigationOptions.weightHistoryRoute: (context) =>
+            const WeightHistoryScreen(),
+        NavigationOptions.fastingRoute: (context) => const FastingScreen(),
+        NavigationOptions.manageProfilesRoute: (context) =>
+            const ManageProfilesScreen(),
+      },
+    );
+  }
+}
